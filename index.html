@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Castillo VR: física, agarrar, sonido y panel</title>
+  <title>Castillo VR: física, agarrar, sonido, panel, lanzar y girar</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <!-- 1) A-Frame: el motor 3D/VR -->
@@ -23,6 +23,19 @@
     const RADIO_ESFERA = 0.12;      // tamaño de las esferas que se agarran (metros)
     const ESFERAS_POR_COLOR = 3;    // cuántas esferas hay de cada color
 
+    // --- Lanzador de pelotas ---
+    const VELOCIDAD_LANZAMIENTO = 20;  // velocidad inicial de la pelota (m/s)
+    const MASA_PELOTA = 1;             // masa de la pelota (kg)
+    const RADIO_PELOTA = 0.15;         // radio de la pelota (metros)
+    const MAX_PELOTAS = 25;            // límite global de pelotas (entre todos los lanzadores)
+    const DISTANCIA_SALIDA = 0.5;      // la pelota aparece esta distancia (m) delante del punto de lanzamiento
+    const COLOR_PELOTA = '#8E24AA';    // morado: distinto de los 4 colores del juego
+
+    // --- Giro con el joystick derecho (por pasos) ---
+    const PASO_GIRO = 30;              // grados por paso
+    const ZONA_MUERTA_GIRO = 0.7;      // la palanca debe pasar de este valor (0 a 1) para girar
+    const UMBRAL_CENTRO_GIRO = 0.3;    // la palanca debe bajar de este valor para permitir otro paso
+
     // Los colores del juego. Debe haber un contenedor con el mismo "nombre"
     // (mira los cilindros con contenedor="color: ..." más abajo en el HTML).
     const COLORES = [
@@ -42,6 +55,9 @@
     const palanca = { x: 0, y: 0 }; // joystick izquierdo del control del Quest
     let quiereSaltar = false;       // se pone en true al presionar Espacio o el botón A
 
+    const pelotas = [];             // pelotas lanzadas (de la más vieja a la más nueva)
+    const manosOcupadas = new Set(); // manos (control o mouse) que están agarrando una esfera
+
 
     /* =====================================================================
        JUGADOR CON ESFERA EN LOS PIES
@@ -56,6 +72,9 @@
         const cuerpo = this.el.body;           // el cuerpo físico (Cannon.js)
         if (!cuerpo) return;                   // aún no se crea
 
+        const camara = document.querySelector('#camara').getObject3D('camera');
+        if (!camara) return;                   // la cámara aún no se crea
+
         // 1. ¿Hacia dónde quiere moverse? Teclado (WASD) o palanca del Quest
         let lado = 0, adelante = 0;
         if (teclas.KeyW) adelante += 1;
@@ -66,10 +85,12 @@
         adelante -= palanca.y;                 // en la palanca, empujar adelante da y negativa
 
         // 2. ¿Hacia dónde está mirando la cámara? (solo en el plano del piso)
+        //    Usamos la cámara real: su dirección ya incluye los giros del joystick derecho.
+        //    getWorldDirection de una cámara ya apunta "al frente" (-Z), sin invertir.
         const frente = new THREE.Vector3();
-        document.querySelector('#camara').object3D.getWorldDirection(frente);
+        camara.getWorldDirection(frente);
         frente.y = 0;
-        frente.normalize().negate();           // en A-Frame "al frente" es -Z
+        frente.normalize();
         const derecha = new THREE.Vector3(-frente.z, 0, frente.x);
 
         // 3. Velocidad = dirección × rapidez. La velocidad en Y no la tocamos (gravedad).
@@ -145,6 +166,8 @@
        - guardar(): mete la esfera y la apila encima de las que ya hay.
        - vaciar(): lo deja sin esferas (al reiniciar).
        El cilindro tiene static-body, así que el jugador no lo atraviesa.
+       Solo revisa elementos con el componente "agarrable": las pelotas lanzadas
+       no lo tienen, así que nunca se guardan ni cuentan.
        ===================================================================== */
     AFRAME.registerComponent('contenedor', {
       schema: {
@@ -224,6 +247,7 @@
 
         this.el.removeAttribute('dynamic-body');           // sin física mientras la cargas
         this.mano = evento.detail.cursorEl;                // el control o la cámara
+        manosOcupadas.add(this.mano);                      // esa mano no puede lanzar mientras agarra
         this.mano.object3D.attach(this.el.object3D);       // ahora se mueve con la mano
         this.mano.addEventListener('mouseup', this.soltar);
       },
@@ -231,6 +255,7 @@
       soltar: function () {
         if (!this.mano) return;
         this.mano.removeEventListener('mouseup', this.soltar);
+        manosOcupadas.delete(this.mano);
         this.mano = null;
 
         this.el.sceneEl.object3D.attach(this.el.object3D); // de regreso a la escena
@@ -264,6 +289,7 @@
       reiniciar: function () {
         if (this.mano) {
           this.mano.removeEventListener('mouseup', this.soltar);
+          manosOcupadas.delete(this.mano);
           this.mano = null;
         }
         this.el.removeAttribute('dynamic-body');
@@ -289,6 +315,187 @@
     }
 
 
+    /* =====================================================================
+       LANZAR PELOTAS
+       Una pelota es una esfera con física (dynamic-body) que sale con una
+       velocidad inicial en la dirección donde apuntas.
+       - NO tiene la clase "agarrable" ni el componente "agarrable": el láser
+         no la detecta, no cuenta en el marcador y los contenedores la ignoran.
+       - Hay un máximo global (MAX_PELOTAS): al pasarte se borra la más vieja.
+       - Las que caen fuera del escenario se borran solas (gestor-pelotas).
+       ===================================================================== */
+    function lanzarPelota(origen, direccion) {
+      const escena = document.querySelector('a-scene');
+      const dir = direccion.clone().normalize();
+
+      // Aparece un poco DELANTE del punto de lanzamiento para no chocar con el jugador
+      const pos = origen.clone().addScaledVector(dir, DISTANCIA_SALIDA);
+
+      const pelota = document.createElement('a-sphere');
+      pelota.setAttribute('position', pos.x + ' ' + pos.y + ' ' + pos.z);
+      pelota.setAttribute('radius', RADIO_PELOTA);
+      pelota.setAttribute('color', COLOR_PELOTA);
+      pelota.setAttribute('class', 'pelota-lanzada');
+      pelota.setAttribute('dynamic-body',
+        'mass: ' + MASA_PELOTA + '; shape: sphere; sphereRadius: ' + RADIO_PELOTA);
+
+      // La velocidad se aplica en cuanto el cuerpo físico existe (el cuerpo se crea
+      // un instante después de agregar la esfera a la escena)
+      pelota.velocidadInicial = dir.multiplyScalar(VELOCIDAD_LANZAMIENTO);
+      pelota.addEventListener('body-loaded', function () { aplicarVelocidadInicial(pelota); });
+
+      escena.appendChild(pelota);
+      pelotas.push(pelota);
+
+      // Más de MAX_PELOTAS: borramos las más viejas
+      while (pelotas.length > MAX_PELOTAS) quitarPelota(pelotas.shift());
+    }
+
+    function aplicarVelocidadInicial(pelota) {
+      const v = pelota.velocidadInicial;
+      if (!v || !pelota.body) return;
+      pelota.body.velocity.set(v.x, v.y, v.z);
+      pelota.body.wakeUp();
+      pelota.velocidadInicial = null;        // ya se aplicó, no repetir
+    }
+
+    function quitarPelota(pelota) {
+      if (pelota.parentNode) pelota.parentNode.removeChild(pelota);
+    }
+
+    function eliminarPelotas() {
+      while (pelotas.length) quitarPelota(pelotas.pop());
+    }
+
+    /* Computadora: lanza desde la cámara, hacia donde mira */
+    function lanzarDesdeCamara() {
+      const camaraEl = document.querySelector('#camara');
+      const camara = camaraEl.getObject3D('camera');
+      if (!camara || manosOcupadas.has(camaraEl)) return;   // sin cámara, o agarrando una esfera con el mouse
+
+      const origen = new THREE.Vector3();
+      const direccion = new THREE.Vector3();
+      camara.getWorldPosition(origen);
+      camara.getWorldDirection(direccion);                  // ya apunta al frente (-Z)
+      lanzarPelota(origen, direccion);
+    }
+
+    /* Quest: botón de agarre lateral (grip) → lanza hacia donde apunta el láser.
+       Usa el mismo rayo del láser, así que la pelota sale justo por donde ves la línea. */
+    AFRAME.registerComponent('lanzador-grip', {
+      init: function () {
+        this.el.addEventListener('gripdown', () => {
+          if (manosOcupadas.has(this.el)) return;           // esta mano está agarrando una esfera
+
+          const origen = new THREE.Vector3();
+          const direccion = new THREE.Vector3();
+          const rc = this.el.components.raycaster;
+          const rayo = rc && rc.raycaster ? rc.raycaster.ray : null;
+
+          if (rayo && rayo.direction.lengthSq() > 0) {
+            origen.copy(rayo.origin);
+            direccion.copy(rayo.direction);
+          } else {
+            // Respaldo: usar la orientación del control (su frente es -Z)
+            this.el.object3D.getWorldPosition(origen);
+            this.el.object3D.getWorldDirection(direccion).negate();
+          }
+          lanzarPelota(origen, direccion);
+        });
+      }
+    });
+
+    /* laser-controls podría usar también el botón grip para "hacer clic" (y por lo tanto agarrar).
+       Aquí fijamos que SOLO el gatillo hace clic. Así grip = lanzar y gatillo = agarrar,
+       y una misma pulsación nunca hace las dos cosas. */
+    AFRAME.registerComponent('solo-gatillo', {
+      init: function () {
+        const fijar = () => {
+          this.el.setAttribute('cursor', { downEvents: ['triggerdown'], upEvents: ['triggerup'] });
+        };
+        fijar();
+        this.el.addEventListener('controllerconnected', fijar);  // por si laser-controls lo reconfigura al conectar
+      }
+    });
+
+    /* Limpieza: borra las pelotas que caen fuera del escenario y aplica
+       la velocidad inicial si el cuerpo físico se creó un poco tarde */
+    AFRAME.registerComponent('gestor-pelotas', {
+      tick: function () {
+        for (let i = pelotas.length - 1; i >= 0; i--) {
+          const pelota = pelotas[i];
+          if (!pelota.parentNode) { pelotas.splice(i, 1); continue; }
+
+          if (pelota.velocidadInicial && pelota.body) aplicarVelocidadInicial(pelota);
+
+          if (pelota.object3D.position.y < -5) {        // cayó fuera del escenario
+            quitarPelota(pelota);
+            pelotas.splice(i, 1);
+          }
+        }
+      }
+    });
+
+
+    /* =====================================================================
+       GIRAR LA VISTA CON EL JOYSTICK DERECHO (giro por pasos)
+       Los controles y la cámara están dentro de #giro, que está dentro de #rig.
+       - #rig sigue a la esfera de los pies (no se gira).
+       - #giro es el que gira sobre el eje vertical.
+       Girar #giro directamente haría que la cabeza "orbite" alrededor de su centro.
+       Por eso, después de girar, movemos #giro lo necesario para que la cabeza
+       quede EXACTAMENTE en el mismo lugar: el giro es sobre tu ubicación actual.
+       ===================================================================== */
+    function girarUsuario(grados) {
+      const rig = document.querySelector('#rig').object3D;
+      const giro = document.querySelector('#giro').object3D;
+      const camara = document.querySelector('#camara').getObject3D('camera');
+      if (!camara) return;
+
+      // Dónde está la cabeza ahora, medida en el espacio del rig
+      const cabeza = new THREE.Vector3();
+      camara.getWorldPosition(cabeza);
+      rig.worldToLocal(cabeza);
+
+      const rad = grados * Math.PI / 180;
+      const c = Math.cos(rad);
+      const s = Math.sin(rad);
+
+      // Cabeza relativa al pivote actual (la posición de #giro)
+      const dx = cabeza.x - giro.position.x;
+      const dz = cabeza.z - giro.position.z;
+
+      // Nuevo pivote: el que deja la cabeza en el mismo punto después de girar
+      giro.position.x = cabeza.x - (dx * c + dz * s);
+      giro.position.z = cabeza.z - (-dx * s + dz * c);
+      giro.rotation.y += rad;
+    }
+
+    AFRAME.registerComponent('giro-por-pasos', {
+      init: function () {
+        this.listo = true;     // ¿ya regresó la palanca al centro?
+
+        this.el.addEventListener('thumbstickmoved', (e) => {
+          const x = e.detail.x;
+          const y = e.detail.y;
+
+          // Después de un paso, hay que devolver la palanca al centro para permitir otro
+          if (!this.listo) {
+            if (Math.hypot(x, y) < UMBRAL_CENTRO_GIRO) this.listo = true;
+            return;
+          }
+
+          // Zona muerta: solo cuenta si empujas fuerte y más hacia los lados que hacia adelante/atrás
+          if (Math.abs(x) >= ZONA_MUERTA_GIRO && Math.abs(x) > Math.abs(y)) {
+            // Palanca a la derecha → girar a la derecha (rotación negativa en Y)
+            girarUsuario(x > 0 ? -PASO_GIRO : PASO_GIRO);
+            this.listo = false;
+          }
+        });
+      }
+    });
+
+
     /* CONCEPTO 3: INTERFAZ DENTRO DEL MUNDO
        El panel es un plano con textos que flota en la escena.
        Para cambiar lo que dice, se cambia el atributo "value" del texto.
@@ -312,6 +519,8 @@
       document.querySelectorAll('[agarrable]').forEach(function (esfera) {
         esfera.components.agarrable.reiniciar();
       });
+      // ...y borramos las pelotas lanzadas
+      eliminarPelotas();
 
       document.querySelector('#texto-instruccion')
         .setAttribute('value', 'Mete cada esfera en el tubo de su color');
@@ -350,10 +559,12 @@
     });
 
 
-    /* Teclado: guardamos qué teclas están presionadas. R = reiniciar, Espacio = saltar */
+    /* Teclado: guardamos qué teclas están presionadas.
+       R = reiniciar, Espacio = saltar, F = lanzar pelota */
     window.addEventListener('keydown', function (e) {
       teclas[e.code] = true;
       if (e.code === 'KeyR') reiniciar();
+      if (e.code === 'KeyF' && !e.repeat) lanzarDesdeCamara();   // un lanzamiento por pulsación
       if (e.code === 'Space') {
         quiereSaltar = true;
         e.preventDefault();                  // que la página no haga scroll
@@ -423,6 +634,9 @@
          PRUEBA CAMBIAR: ESFERAS_POR_COLOR o la lista COLORES en el script. -->
     <a-entity crear-esferas></a-entity>
 
+    <!-- Limpia las pelotas lanzadas que caen fuera del escenario -->
+    <a-entity gestor-pelotas></a-entity>
+
 
     <!-- ================= CONTENEDORES CILÍNDRICOS en la terraza =================
          Un tubo transparente por color. Las esferas se ven apiladas adentro.
@@ -460,19 +674,37 @@
     </a-entity>
 
 
-    <!-- ================= PANEL FLOTANTE (interfaz en el mundo) ================= -->
-    <a-entity position="-1.5 3.1 -9.8">
-      <a-plane width="3" height="1.1" color="#1C2128" opacity="0.9"></a-plane>
+    <!-- ================= PANEL FLOTANTE (interfaz en el mundo) =================
+         Ahora es más alto para incluir la lista de controles.
+         (Sin acentos en el texto: la fuente por defecto de A-Frame no los dibuja bien.) -->
+    <a-entity position="-1.5 2.95 -9.8">
+      <a-plane width="3.6" height="2.1" color="#1C2128" opacity="0.9"></a-plane>
       <a-text id="texto-instruccion" value="Mete cada esfera en el tubo de su color"
-              align="center" width="3" position="0 0.3 0.01" color="#FFFFFF"></a-text>
+              align="center" width="3" position="0 0.92 0.01" color="#FFFFFF"></a-text>
       <!-- El número se escribe desde el script (actualizarPanel) -->
       <a-text id="texto-marcador" value="Esferas: 0"
-              align="center" width="4" position="0 0 0.01" color="#FFB547"></a-text>
+              align="center" width="4" position="0 0.66 0.01" color="#FFB547"></a-text>
+
+      <!-- Controles (una línea por a-text para que se vea bien en cualquier equipo) -->
+      <a-text value="CONTROLES" align="center" width="2.2" position="0 0.38 0.01" color="#FFFFFF"></a-text>
+      <a-text value="PC: WASD camina | Espacio salta"
+              align="center" width="3.2" position="0 0.20 0.01" color="#9AD1FF"></a-text>
+      <a-text value="PC: clic sostenido agarra una esfera"
+              align="center" width="3.2" position="0 0.05 0.01" color="#9AD1FF"></a-text>
+      <a-text value="PC: F lanza pelota | R reinicia"
+              align="center" width="3.2" position="0 -0.10 0.01" color="#9AD1FF"></a-text>
+      <a-text value="Quest: palanca izq. camina | A salta"
+              align="center" width="3.2" position="0 -0.25 0.01" color="#C5E1A5"></a-text>
+      <a-text value="Quest: palanca der. gira 30 grados"
+              align="center" width="3.2" position="0 -0.40 0.01" color="#C5E1A5"></a-text>
+      <a-text value="Quest: gatillo agarra | grip lanza"
+              align="center" width="3.2" position="0 -0.55 0.01" color="#C5E1A5"></a-text>
+
       <!-- Botón: tiene class="agarrable" para que el láser lo detecte,
            pero no el componente agarrable, así que no se mueve -->
       <a-plane class="agarrable" boton-reiniciar width="0.9" height="0.25"
-               position="0 -0.35 0.01" color="#FFB547"></a-plane>
-      <a-text value="Reiniciar" align="center" width="2.5" position="0 -0.35 0.02" color="#1C2128"></a-text>
+               position="0 -0.85 0.01" color="#FFB547"></a-plane>
+      <a-text value="Reiniciar" align="center" width="2.5" position="0 -0.85 0.02" color="#1C2128"></a-text>
     </a-entity>
 
 
@@ -482,20 +714,31 @@
     <a-sphere id="pies" jugador visible="false" radius="0.35" position="0 0.35 4"
               dynamic-body="mass: 5; shape: sphere; sphereRadius: 0.35; angularDamping: 1"></a-sphere>
 
-    <!-- Rig: la "cabeza y manos". Su posición la controla el componente jugador. -->
+    <!-- Rig: sigue a la esfera de los pies (su posición la controla el componente jugador).
+         Adentro está #giro, que es el que gira con el joystick derecho y
+         contiene la cabeza (cámara) y las manos (controles). -->
     <a-entity id="rig" position="0 0 4">
+      <a-entity id="giro">
 
-      <!-- COMPUTADORA: el mouse apunta. Mantén el clic sobre una esfera para cargarla
-           (arrastra para girar la vista) y suelta el clic para dejarla caer.
-           WASD camina y ESPACIO salta. -->
-      <a-entity id="camara" camera look-controls position="0 1.6 0"
-                cursor="rayOrigin: mouse" raycaster="objects: .agarrable"></a-entity>
+        <!-- COMPUTADORA: el mouse apunta. Mantén el clic sobre una esfera para cargarla
+             (arrastra para girar la vista) y suelta el clic para dejarla caer.
+             WASD camina, ESPACIO salta y F lanza una pelota hacia donde miras. -->
+        <a-entity id="camara" camera look-controls position="0 1.6 0"
+                  cursor="rayOrigin: mouse" raycaster="objects: .agarrable"></a-entity>
 
-      <!-- QUEST: apunta con el láser y mantén el GATILLO para agarrar.
-           La palanca del control IZQUIERDO sirve para caminar.
-           El botón A del control DERECHO sirve para saltar. -->
-      <a-entity laser-controls="hand: right" raycaster="objects: .agarrable; far: 6" boton-saltar></a-entity>
-      <a-entity laser-controls="hand: left"  raycaster="objects: .agarrable; far: 6" palanca-caminar></a-entity>
+        <!-- QUEST: apunta con el láser y mantén el GATILLO para agarrar.
+             El botón de AGARRE lateral (grip) de cada control lanza una pelota.
+             La palanca del control IZQUIERDO sirve para caminar.
+             La palanca del control DERECHO gira la vista de 30 en 30 grados.
+             El botón A del control DERECHO sirve para saltar. -->
+        <a-entity id="mano-derecha" laser-controls="hand: right"
+                  raycaster="objects: .agarrable; far: 6"
+                  solo-gatillo boton-saltar giro-por-pasos lanzador-grip></a-entity>
+        <a-entity id="mano-izquierda" laser-controls="hand: left"
+                  raycaster="objects: .agarrable; far: 6"
+                  solo-gatillo palanca-caminar lanzador-grip></a-entity>
+
+      </a-entity>
     </a-entity>
 
   </a-scene>
