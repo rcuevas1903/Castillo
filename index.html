@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Castillo VR: física, agarrar, sonido, panel, lanzar, girar y correr</title>
+  <title>Castillo VR: física, agarrar, sonido, panel, lanzar, girar, correr y basketball</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <!-- 1) A-Frame: el motor 3D/VR -->
@@ -24,16 +24,20 @@
     const RADIO_ESFERA = 0.12;      // tamaño de las esferas que se agarran (metros)
     const ESFERAS_POR_COLOR = 3;    // cuántas esferas hay de cada color
 
+    // --- Canastas (basketball) ---
+    const RADIO_ARO = 0.4;          // radio del aro (metros). Más pequeño = más difícil
+    const DURACION_AVISO = 1500;    // cuánto dura en pantalla el aviso "ROJO: 1/3" (milisegundos)
+
     // --- Lanzar la esfera que tienes agarrada ---
-    const VELOCIDAD_LANZAMIENTO = 20;  // velocidad inicial al lanzar (m/s)
+    const VELOCIDAD_LANZAMIENTO = 10;  // velocidad inicial al lanzar (m/s)
 
     // --- Giro con el joystick derecho (por pasos) ---
-    const PASO_GIRO = 30;              // grados por paso
+    const PASO_GIRO = 50;              // grados por paso
     const ZONA_MUERTA_GIRO = 0.7;      // la palanca debe pasar de este valor (0 a 1) para girar
     const UMBRAL_CENTRO_GIRO = 0.3;    // la palanca debe bajar de este valor para permitir otro paso
 
-    // Los colores del juego. Debe haber un contenedor con el mismo "nombre"
-    // (mira los cilindros con contenedor="color: ..." más abajo en el HTML).
+    // Los colores del juego. Debe haber una canasta con el mismo "nombre"
+    // (mira las <a-entity canasta="color: ..."> más abajo en el HTML).
     const COLORES = [
       { nombre: 'rojo',     hex: '#E53935' },
       { nombre: 'verde',    hex: '#43A047' },
@@ -41,12 +45,14 @@
       { nombre: 'amarillo', hex: '#FDD835' }
     ];
 
-    const TOTAL = COLORES.length * ESFERAS_POR_COLOR; // cuántas esferas hay que guardar
+    const TOTAL = COLORES.length * ESFERAS_POR_COLOR; // cuántas esferas hay que encestar
 
     // Propiedades de física de las esferas (las usamos en varios lugares)
     const FISICA_ESFERA = 'mass: 1; linearDamping: 0.3; angularDamping: 0.5';
 
-    let colocadas = 0;              // cuántas esferas ya están en su contenedor
+    let colocadas = 0;              // cuántas esferas ya se encestaron en su canasta
+    const conteo = {};              // cuántas van por color (ej. conteo.rojo = 1)
+    COLORES.forEach(function (c) { conteo[c.nombre] = 0; });
     const teclas = {};              // qué teclas están presionadas
     const palanca = { x: 0, y: 0 }; // joystick izquierdo del control del Quest
     let quiereSaltar = false;       // se pone en true al presionar Espacio o el botón A
@@ -162,55 +168,114 @@
 
 
     /* =====================================================================
-       CONTENEDOR CILÍNDRICO
-       Es un tubo transparente donde caben varias esferas de UN color.
-       - estaEncima(): revisa si una esfera está en la boca (parte de arriba) del tubo.
-       - guardar(): mete la esfera y la apila encima de las que ya hay.
-       - vaciar(): lo deja sin esferas (al reiniciar).
-       El cilindro tiene static-body, así que el jugador no lo atraviesa.
+       CANASTA DE BASKETBALL
+       Cada color tiene su propia canasta: poste, tablero, aro y red.
+       Todo se crea con JavaScript en coordenadas del mundo (sin entidades
+       anidadas) para que los cuerpos físicos queden justo donde se ven.
+       - El poste, el tablero y el aro son static-body: las esferas rebotan en ellos
+         (¡puedes meter la esfera "de rebote" en el tablero!).
+       - El centro del aro está VACÍO, así que la esfera puede caer por el hueco.
+       - cruce(): avisa si una esfera acaba de atravesar el aro de arriba hacia abajo.
+
+       Parámetros (se escriben en el HTML, en <a-entity canasta="...">):
+         color     → qué color de esfera acepta (igual que en COLORES)
+         posicion  → base del poste: x, y del piso (0, o 1.2 sobre la terraza), z
+         giro      → hacia dónde mira el aro, en grados:
+                     0 = hacia +X · 90 = hacia -Z (fondo) · 180 = hacia -X · -90 = hacia +Z (la puerta)
+         altura    → altura del aro sobre la base (m). El de un juego real mide 3.05 m
+         radio     → radio del aro (por defecto RADIO_ARO)
        ===================================================================== */
-    AFRAME.registerComponent('contenedor', {
+    AFRAME.registerComponent('canasta', {
       schema: {
-        color: { type: 'string' }    // qué color acepta (ej. "rojo")
+        color:    { type: 'string' },
+        posicion: { type: 'vec3' },
+        giro:     { type: 'number', default: 0 },
+        altura:   { type: 'number', default: 2.2 },
+        radio:    { type: 'number', default: RADIO_ARO }
       },
 
       init: function () {
-        this.cantidad = 0;           // cuántas esferas tiene dentro
+        const d = this.data;
+        const info = COLORES.find(function (c) { return c.nombre === d.color; });
+        const hex = info ? info.hex : '#FFFFFF';
+        const H = d.altura;                    // altura del aro
+        const CX = 0.65;                       // el centro del aro queda 0.65 m al frente del poste
+
+        // Sistema local: origen en la base del poste, +x hacia donde mira el aro
+        const marco = new THREE.Object3D();
+        marco.position.set(d.posicion.x, d.posicion.y, d.posicion.z);
+        marco.rotation.y = d.giro * Math.PI / 180;
+        marco.updateMatrixWorld(true);
+        const P = function (x, y, z) { return marco.localToWorld(new THREE.Vector3(x, y, z)); };
+
+        this.centro = P(CX, H, 0);             // centro del aro en el mundo (para detectar la encestada)
+
+        const escena = this.el.sceneEl;
+        const crear = function (tag, pos, attrs, rot) {
+          const el = document.createElement(tag);
+          Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+          el.setAttribute('position', { x: pos.x, y: pos.y, z: pos.z });
+          if (rot) el.setAttribute('rotation', rot);
+          escena.appendChild(el);
+          return el;
+        };
+        const giro = { x: 0, y: d.giro, z: 0 };
+
+        // --- Poste (con física) y base de color (solo decoración) ---
+        crear('a-cylinder', P(0, (H + 0.6) / 2, 0), {
+          radius: 0.06, height: H + 0.6, color: '#546E7A', 'static-body': ''
+        });
+        crear('a-cylinder', P(0, 0.02, 0), { radius: 0.25, height: 0.04, color: hex });
+
+        // --- Tablero translúcido (con física) ---
+        crear('a-box', P(0.11, H + 0.25, 0), {
+          width: 0.08, height: 0.8, depth: 1.2,
+          material: 'color: #FFFFFF; opacity: 0.35; transparent: true', 'static-body': ''
+        }, giro);
+
+        // --- Marco y cuadro de puntería del tablero, del color de la canasta (solo decoración) ---
+        const linea = function (y, z, alto, prof) {
+          crear('a-box', P(0.16, y, z), {
+            width: 0.02, height: alto, depth: prof, color: hex
+          }, giro);
+        };
+        linea(H + 0.63, 0, 0.04, 1.2);   linea(H - 0.13, 0, 0.04, 1.2);      // marco: arriba y abajo
+        linea(H + 0.25, -0.58, 0.8, 0.04); linea(H + 0.25, 0.58, 0.8, 0.04); // marco: lados
+        linea(H + 0.42, 0, 0.03, 0.6);   linea(H + 0.08, 0, 0.03, 0.6);      // cuadro de puntería
+        linea(H + 0.25, -0.3, 0.34, 0.03); linea(H + 0.25, 0.3, 0.34, 0.03);
+
+        // --- Soporte entre el tablero y el aro (decoración) ---
+        crear('a-box', P(0.2, H, 0), { width: 0.1, height: 0.04, depth: 0.06, color: hex }, giro);
+
+        // --- Aro: anillo de cajitas estáticas con el centro VACÍO ---
+        const SEG = 16, GROSOR = 0.05;
+        const largo = 2 * d.radio * Math.sin(Math.PI / SEG) * 1.12;    // 12 % de traslape
+        for (let k = 0; k < SEG; k++) {
+          const a = (k / SEG) * Math.PI * 2;
+          crear('a-box', P(CX + Math.cos(a) * d.radio, H, Math.sin(a) * d.radio), {
+            width: largo, height: GROSOR, depth: GROSOR, color: hex, 'static-body': ''
+          }, { x: 0, y: d.giro - (a * 180 / Math.PI) - 90, z: 0 });
+        }
+
+        // --- Red (solo decoración: la esfera la atraviesa) ---
+        crear('a-cylinder', P(CX, H - 0.2, 0), {
+          'radius-top': d.radio, 'radius-bottom': 0.22, height: 0.4, 'open-ended': true,
+          'segments-radial': 12, 'segments-height': 4,
+          material: 'wireframe: true; color: #FFFFFF; opacity: 0.8; transparent: true; side: double'
+        });
       },
 
-      estaEncima: function (posicionEsfera) {
-        const centro = this.el.object3D.position;
-        const forma = this.el.getAttribute('geometry');  // aquí vienen radius y height
-        const boca = centro.y + forma.height / 2;        // altura de la parte de arriba
-
-        // Distancia horizontal (sin contar la altura) entre la esfera y el centro del tubo
-        const dx = posicionEsfera.x - centro.x;
-        const dz = posicionEsfera.z - centro.z;
-        const distancia = Math.sqrt(dx * dx + dz * dz);
-
-        // Está encima si queda dentro del círculo del tubo y cerca de la boca
-        return distancia < forma.radius + 0.05 &&
-               posicionEsfera.y > boca - 0.05 &&
-               posicionEsfera.y < boca + 0.4;
-      },
-
-      guardar: function (esferaEl) {
-        const centro = this.el.object3D.position;
-        const forma = this.el.getAttribute('geometry');
-        const fondo = centro.y - forma.height / 2;       // altura del piso del tubo
-
-        // Le quitamos la física para que se quede quieta adentro
-        esferaEl.removeAttribute('dynamic-body');
-
-        // La apilamos: la primera toca el fondo, cada una nueva va un diámetro más arriba
-        const altura = fondo + RADIO_ESFERA + this.cantidad * RADIO_ESFERA * 2;
-        esferaEl.object3D.position.set(centro.x, altura, centro.z);
-
-        this.cantidad++;
-      },
-
-      vaciar: function () {
-        this.cantidad = 0;
+      /* ¿La esfera atravesó el aro de arriba hacia abajo entre la posición
+         anterior (a) y la actual (b)? Con la esfera lanzada rápido puede avanzar
+         varios centímetros por cuadro, así que calculamos DÓNDE cruzó el plano del aro. */
+      cruce: function (a, b) {
+        const c = this.centro;
+        if (!c || !(a.y > c.y && b.y <= c.y)) return false;
+        const t = (a.y - c.y) / (a.y - b.y);                 // qué parte del trayecto ocurrió antes de cruzar
+        const x = a.x + (b.x - a.x) * t;
+        const z = a.z + (b.z - a.z) * t;
+        // Debe cruzar por dentro del aro (la esfera completa, no solo su centro)
+        return Math.hypot(x - c.x, z - c.z) < this.data.radio - RADIO_ESFERA;
       }
     });
 
@@ -224,8 +289,8 @@
        - Al LANZAR: igual que soltar, pero además le damos una velocidad inicial
          (VELOCIDAD_LANZAMIENTO) hacia donde apunta la mano. Solo se puede lanzar
          una esfera que tienes agarrada.
-       - Si cae en la boca del contenedor de SU color, se guarda y cuenta.
-       - Si cae en un contenedor de OTRO color, regresa a la cesta.
+       - Si atraviesa el aro de SU color, cuenta como encestada (y ya no se puede agarrar).
+       - Si atraviesa el aro de OTRO color, regresa a la cesta.
        - Si sale volando fuera del escenario, regresa a la cesta.
        En Unity esto es el componente "XR Grab Interactable".
        ===================================================================== */
@@ -236,9 +301,11 @@
 
       init: function () {
         this.mano = null;            // quién la tiene agarrada (null = nadie)
-        this.colocada = false;       // ¿ya está en su contenedor?
+        this.colocada = false;       // ¿ya la encestaste en su canasta?
         this.velocidadPendiente = null;   // velocidad que se aplica justo al lanzarla
         this.posicionInicial = this.el.object3D.position.clone();
+        this.anterior = new THREE.Vector3();   // dónde estaba en el cuadro anterior
+        this.hayAnterior = false;              // (para saber de dónde viene al cruzar un aro)
 
         this.agarrar = this.agarrar.bind(this);
         this.soltar = this.soltar.bind(this);
@@ -254,6 +321,7 @@
         if (manosOcupadas.has(mano)) return;               // esa mano ya sostiene otra esfera
 
         this.velocidadPendiente = null;
+        this.hayAnterior = false;
         this.el.removeAttribute('dynamic-body');           // sin física mientras la cargas
         this.mano = mano;
         manosOcupadas.set(mano, this);                     // así sabemos qué esfera puede lanzar esa mano
@@ -297,7 +365,8 @@
       // tick se ejecuta en cada cuadro
       tick: function () {
         this.aplicarVelocidad();                           // por si el cuerpo se creó un cuadro tarde
-        if (this.colocada || this.mano) return;
+        if (this.colocada) return;
+        if (this.mano) { this.hayAnterior = false; return; }
 
         const posicion = this.el.object3D.position;
 
@@ -307,24 +376,29 @@
           return;
         }
 
-        // Revisamos si la esfera llegó a un contenedor
-        const contenedores = document.querySelectorAll('[contenedor]');
+        // ¿Atravesó algún aro entre el cuadro anterior y este?
+        if (this.hayAnterior) {
+          const canastas = document.querySelectorAll('[canasta]');
 
-        for (const el of contenedores) {
-          const contenedor = el.components.contenedor;
-          if (!contenedor.estaEncima(posicion)) continue;  // no está en este, revisa el siguiente
+          for (const el of canastas) {
+            const canasta = el.components.canasta;
+            if (!canasta || !canasta.cruce(this.anterior, posicion)) continue;
 
-          if (contenedor.data.color === this.data.color) {
-            // Color correcto: se guarda en el tubo
-            contenedor.guardar(this.el);
-            this.colocada = true;
-            esferaColocada();
-          } else {
-            // Color equivocado: regresa a la cesta
-            this.reiniciar();
+            if (canasta.data.color === this.data.color) {
+              // Aro correcto: ¡encestada! Ya no se puede volver a agarrar
+              this.colocada = true;
+              this.el.classList.remove('agarrable');
+              esferaColocada(this.data.color);
+            } else {
+              // Aro equivocado: regresa a la cesta
+              this.reiniciar();
+            }
+            return;
           }
-          return;
         }
+
+        this.anterior.copy(posicion);
+        this.hayAnterior = true;
       },
 
       reiniciar: function () {
@@ -334,18 +408,28 @@
           this.mano = null;
         }
         this.velocidadPendiente = null;
+        this.hayAnterior = false;
         this.el.removeAttribute('dynamic-body');
         this.el.sceneEl.object3D.attach(this.el.object3D);
         this.el.object3D.position.copy(this.posicionInicial);
         this.el.setAttribute('dynamic-body', FISICA_ESFERA);
+        this.el.classList.add('agarrable');
         this.colocada = false;
       }
     });
 
 
-    /* Se llama cada vez que una esfera entra a su contenedor */
-    function esferaColocada() {
+    /* Se llama cada vez que una esfera se encesta en su canasta */
+    function esferaColocada(nombreColor) {
       colocadas++;
+      conteo[nombreColor]++;
+
+      // AVISO EN PANTALLA: "ROJO: 1/3" durante DURACION_AVISO milisegundos
+      const info = COLORES.find(function (c) { return c.nombre === nombreColor; });
+      document.querySelector('#aviso').components['aviso-puntos'].mostrar(
+        nombreColor.toUpperCase() + ': ' + conteo[nombreColor] + '/' + ESFERAS_POR_COLOR,
+        info.hex
+      );
 
       // CONCEPTO 2: SONIDO ESPACIAL
       // La campana está en lo alto de la torre. El sonido sale DESDE ahí:
@@ -355,6 +439,42 @@
 
       actualizarPanel();
     }
+
+
+    /* =====================================================================
+       AVISO EN PANTALLA (HUD)
+       Es un texto pegado a la cámara: se ve igual en la computadora y dentro
+       del visor. Aparece arriba, pequeño y semitransparente (sin estorbar),
+       y se esconde solo después de DURACION_AVISO. Se dibuja siempre encima
+       de todo, así que ningún muro lo tapa.
+       ===================================================================== */
+    AFRAME.registerComponent('aviso-puntos', {
+      init: function () {
+        this.temporizador = null;
+      },
+
+      mostrar: function (texto, color) {
+        const el = this.el;
+        const letrero = el.querySelector('a-text');
+        letrero.setAttribute('value', texto);
+        letrero.setAttribute('color', color);
+        el.setAttribute('visible', true);
+
+        // Siempre encima de la escena (sin que los muros lo oculten)
+        el.object3D.traverse(function (o) {
+          if (o.material) {
+            o.material.depthTest = false;
+            o.material.depthWrite = false;
+            o.renderOrder = 999;
+          }
+        });
+
+        clearTimeout(this.temporizador);       // si encestas otra antes de que termine, reinicia el tiempo
+        this.temporizador = setTimeout(function () {
+          el.setAttribute('visible', false);
+        }, DURACION_AVISO);
+      }
+    });
 
 
     /* =====================================================================
@@ -500,18 +620,15 @@
 
     function reiniciar() {
       colocadas = 0;
+      COLORES.forEach(function (c) { conteo[c.nombre] = 0; });
 
-      // Vaciamos los contenedores...
-      document.querySelectorAll('[contenedor]').forEach(function (tubo) {
-        tubo.components.contenedor.vaciar();
-      });
-      // ...y regresamos todas las esferas a la cesta
+      // Regresamos todas las esferas a la cesta
       document.querySelectorAll('[agarrable]').forEach(function (esfera) {
         esfera.components.agarrable.reiniciar();
       });
 
       document.querySelector('#texto-instruccion')
-        .setAttribute('value', 'Mete cada esfera en el tubo de su color');
+        .setAttribute('value', 'Encesta cada esfera en el aro de su color');
       actualizarPanel();
     }
 
@@ -623,30 +740,24 @@
     <a-entity crear-esferas></a-entity>
 
 
-    <!-- ================= CONTENEDORES CILÍNDRICOS en la terraza =================
-         Un tubo transparente por color. Las esferas se ven apiladas adentro.
-         contenedor="color: ..."  → qué color acepta (igual que en la lista COLORES)
-         open-ended="true"        → el tubo no tiene tapas (se ve hueco)
-         side="double"            → se ve también la pared de adentro
-         static-body              → el jugador y las esferas chocan con él
-         radius="0.18"            → un poco más ancho que una esfera (radio 0.12)
-         height="0.82"            → caben 3 esferas apiladas (3 × 0.24 m) y sobra un poco
-         La terraza está en y = 1.2, así que el centro va en y = 1.2 + 0.82 / 2 = 1.61 -->
-    <a-cylinder contenedor="color: rojo"     static-body position="-1.5 1.61 -8.5"
-                radius="0.18" height="0.82" open-ended="true" side="double"
-                color="#E53935" opacity="0.4"></a-cylinder>
+    <!-- ================= CANASTAS DE BASKETBALL (una por color) =================
+         Cada una es distinta: otro lugar, otra altura y el color de su aro.
+         El componente "canasta" (en el <script>) construye poste, tablero, aro y red.
+           posicion → base del poste (x, y del piso, z). En la terraza el piso está en y = 1.2
+           giro     → hacia dónde mira el aro (0 = +X, 90 = fondo, 180 = -X, -90 = la puerta)
+           altura   → altura del aro sobre la base. PRUEBA CAMBIAR: 3.05 es la de un juego real -->
 
-    <a-cylinder contenedor="color: verde"    static-body position="-0.3 1.61 -8.5"
-                radius="0.18" height="0.82" open-ended="true" side="double"
-                color="#43A047" opacity="0.4"></a-cylinder>
+    <!-- ROJO: pared izquierda del patio, la más baja (aro a 2.0 m) -->
+    <a-entity canasta="color: rojo; posicion: -4.45 0 -1.8; giro: 0; altura: 2.0"></a-entity>
 
-    <a-cylinder contenedor="color: azul"     static-body position="0.9 1.61 -8.5"
-                radius="0.18" height="0.82" open-ended="true" side="double"
-                color="#1E88E5" opacity="0.4"></a-cylinder>
+    <!-- VERDE: pared derecha del patio, cerca de la entrada (aro a 2.5 m) -->
+    <a-entity canasta="color: verde; posicion: 4.45 0 -1.0; giro: 180; altura: 2.5"></a-entity>
 
-    <a-cylinder contenedor="color: amarillo" static-body position="2.1 1.61 -8.5"
-                radius="0.18" height="0.82" open-ended="true" side="double"
-                color="#FDD835" opacity="0.4"></a-cylinder>
+    <!-- AZUL: sobre la terraza, mirando al patio (aro a 1.2 + 1.8 = 3.0 m) -->
+    <a-entity canasta="color: azul; posicion: 1.8 1.2 -9.55; giro: -90; altura: 1.8"></a-entity>
+
+    <!-- AMARILLO: esquina izquierda de la terraza, la más alta (aro a 1.2 + 2.2 = 3.4 m) -->
+    <a-entity canasta="color: amarillo; posicion: -4.45 1.2 -8.3; giro: 0; altura: 2.2"></a-entity>
 
 
     <!-- ================= CAMPANA con sonido 3D (encima de la torre) =================
@@ -662,7 +773,7 @@
     <!-- ================= PANEL FLOTANTE (interfaz en el mundo) ================= -->
     <a-entity position="-1.5 3.1 -9.8">
       <a-plane width="3" height="1.1" color="#1C2128" opacity="0.9"></a-plane>
-      <a-text id="texto-instruccion" value="Mete cada esfera en el tubo de su color"
+      <a-text id="texto-instruccion" value="Encesta cada esfera en el aro de su color"
               align="center" width="3" position="0 0.3 0.01" color="#FFFFFF"></a-text>
       <!-- El número se escribe desde el script (actualizarPanel) -->
       <a-text id="texto-marcador" value="Esferas: 0"
@@ -690,9 +801,19 @@
         <!-- COMPUTADORA: el mouse apunta. Mantén el clic sobre una esfera para cargarla
              (arrastra para girar la vista) y suelta el clic para dejarla caer.
              WASD camina, SHIFT corre, ESPACIO salta.
-             F lanza la esfera que tienes agarrada hacia donde mira la cámara. -->
+             F lanza la esfera que tienes agarrada hacia donde mira la cámara.
+
+             AVISO EN PANTALLA (#aviso): va pegado a la cámara, así se ve en la
+             computadora y dentro del visor. Es invisible hasta que encestas;
+             entonces muestra "ROJO: 1/3" durante DURACION_AVISO (1.5 s). -->
         <a-entity id="camara" camera look-controls position="0 1.6 0"
-                  cursor="rayOrigin: mouse" raycaster="objects: .agarrable"></a-entity>
+                  cursor="rayOrigin: mouse" raycaster="objects: .agarrable">
+          <a-entity id="aviso" aviso-puntos visible="false" position="0 0.5 -1.2">
+            <a-plane width="0.7" height="0.16" color="#000000"
+                     material="opacity: 0.45; transparent: true; depthTest: false"></a-plane>
+            <a-text value="" align="center" width="1.6" color="#FFFFFF" position="0 0 0.01"></a-text>
+          </a-entity>
+        </a-entity>
 
         <!-- QUEST: apunta con el láser y mantén el GATILLO para agarrar una esfera.
              Grip DERECHO: lanza la esfera que tienes agarrada.
